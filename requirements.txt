@@ -2,3 +2,4 @@ discord.py>=2.4.0
 aiohttp>=3.8.0
 Pillow>=9.0.0
 imagehash>=4.3
+flask
