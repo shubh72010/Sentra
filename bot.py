@@ -110,25 +110,13 @@ def is_similar_hash(h1: imagehash.ImageHash, h2: imagehash.ImageHash, tol: int =
 # ---------- Bot events ----------
 
 @bot.event
-async def on_ready():
-    global known_hashes
-    log.info(f"Logged in as {bot.user} (id: {bot.user.id})")
-    loaded_from_json = load_hashes_from_json()
-    if loaded_from_json:
-        known_hashes = loaded_from_json
-    else:
-        known_hashes = load_hashes_from_folder()
-        save_hashes_to_json(known_hashes)
-    log.info(f"Known spam fingerprints: {len(known_hashes)}")
-
-@bot.event
 async def on_message(message: discord.Message):
     if message.author == bot.user:
         return
 
     images_to_check = []
 
-    # 1️⃣ Add attachments
+    # 1️⃣ Attachments
     for att in message.attachments:
         ctype = getattr(att, "content_type", None)
         if ctype and not ctype.startswith("image"):
@@ -140,16 +128,16 @@ async def on_message(message: discord.Message):
         except Exception as e:
             log.warning(f"Failed to process attachment {att.filename}: {e}")
 
-    # 2️⃣ Add Discord media links using regex
+    # 2️⃣ Discord media links with query params intact
     for match in DISCORD_MEDIA_RE.findall(message.content):
         try:
-            data = await download_image_bytes(match)
+            data = await download_image_bytes(match)  # full URL with query string
             with Image.open(io.BytesIO(data)) as img:
                 images_to_check.append(img.copy())
         except Exception as e:
             log.warning(f"Failed to fetch image from link {match}: {e}")
 
-    # 3️⃣ Check all images
+    # 3️⃣ Check images
     for img in images_to_check:
         phash = compute_phash_from_pil(img)
         for spam_name, spam_hash in known_hashes.items():
