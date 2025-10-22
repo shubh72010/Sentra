@@ -26,7 +26,9 @@ SPAM_FOLDER = "spam_images"
 HASHES_FILE = "hashes.json"
 HASH_TOLERANCE = int(os.environ.get("HASH_TOLERANCE", "5"))
 ALERT_MESSAGE = "⚠️ A spam image was removed."
-DISCORD_MEDIA_RE = re.compile(r'https?://(?:cdn|media)\.discordapp\.net/attachments/\d+/\d+/\S+')
+DISCORD_MEDIA_RE = re.compile(
+    r'https?://(?:cdn|media)\.discordapp\.net/attachments/\d+/\d+/[^?\s]+'
+)
 # ----------------------------
 
 # Logging
@@ -94,11 +96,12 @@ def load_hashes_from_json(infile: str = HASHES_FILE) -> Dict[str, imagehash.Imag
         return {}
 
 async def download_image_bytes(url: str) -> bytes:
+    clean_url = url.split('?')[0]  # remove query parameters
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as resp:
+        async with session.get(clean_url) as resp:
             if resp.status != 200:
-                raise RuntimeError(f"Failed to GET {url} -> {resp.status}")
+                raise RuntimeError(f"Failed to GET {clean_url} -> {resp.status}")
             return await resp.read()
 
 def is_similar_hash(h1: imagehash.ImageHash, h2: imagehash.ImageHash, tol: int = HASH_TOLERANCE) -> bool:
@@ -140,8 +143,7 @@ async def on_message(message: discord.Message):
     # 2️⃣ Add Discord media links using regex
     for match in DISCORD_MEDIA_RE.findall(message.content):
         try:
-            url = match.split("?")[0]  # strip query parameters
-            data = await download_image_bytes(url)
+            data = await download_image_bytes(match)
             with Image.open(io.BytesIO(data)) as img:
                 images_to_check.append(img.copy())
         except Exception as e:
