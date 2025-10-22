@@ -292,3 +292,19 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# --- Fake web server to keep Render alive (Free Plan fix) ---
+from threading import Thread
+from flask import Flask
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "🛡️ Sentra is running and connected to Discord!"
+
+def run_web():
+    app.run(host='0.0.0.0', port=10000)
+
+Thread(target=run_web).start()
+# --- End of fake web server ---
