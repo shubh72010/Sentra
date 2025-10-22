@@ -281,6 +281,22 @@ async def remove_spam(ctx, *, name: str):
 async def ping(ctx):
     await ctx.send("pong", delete_after=5)
 
+# bot alive thingy
+
+from flask import Flask
+import threading
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Sentra bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=10000)
+
+threading.Thread(target=run).start()
+
 # ---------- Start bot ----------
 
 def main():
