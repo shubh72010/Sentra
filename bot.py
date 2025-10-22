@@ -1,24 +1,20 @@
 # bot.py
 # Anti-spam Discord bot using perceptual hashing (imagehash + Pillow)
-# Handles attachments + embedded Discord media links
-# Admin commands included
-# Keep-alive Flask server for Render Free plan
 
 import os
 import io
 import asyncio
 import logging
 from typing import Dict
-import threading
-import json
-import re
 
 import aiohttp
 import discord
 from discord.ext import commands
 from PIL import Image, ImageOps, UnidentifiedImageError
 import imagehash
+import json
 from flask import Flask
+from threading import Thread
 
 # ---------- CONFIG ----------
 ENV_TOKEN_NAME = "DISCORD_BOT_TOKEN"
@@ -26,27 +22,21 @@ SPAM_FOLDER = "spam_images"
 HASHES_FILE = "hashes.json"
 HASH_TOLERANCE = int(os.environ.get("HASH_TOLERANCE", "5"))
 ALERT_MESSAGE = "⚠️ A spam image was removed."
-DISCORD_MEDIA_RE = re.compile(
-    r'https?://(?:cdn|media)\.discordapp\.net/attachments/\d+/\d+/[^?\s]+'
-)
 # ----------------------------
 
-# Logging
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("anti-spam-bot")
 
-# Intents
+# ---------- Discord Bot ----------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.messages = True
 intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-# In-memory store: {filename: imagehash}
 known_hashes: Dict[str, imagehash.ImageHash] = {}
 
-# ---------- Utility functions ----------
+# ---------- Utility Functions ----------
 
 def compute_phash_from_pil(img: Image.Image) -> imagehash.ImageHash:
     img = ImageOps.exif_transpose(img).convert("RGB")
@@ -58,17 +48,17 @@ def load_hashes_from_folder(folder: str = SPAM_FOLDER) -> Dict[str, imagehash.Im
         log.info(f"Spam folder '{folder}' does not exist — creating.")
         os.makedirs(folder, exist_ok=True)
         return results
+
     for fn in os.listdir(folder):
         path = os.path.join(folder, fn)
         if not os.path.isfile(path):
             continue
         try:
             with Image.open(path) as img:
-                ph = compute_phash_from_pil(img)
-                results[fn] = ph
-                log.info(f"Loaded spam image '{fn}', phash={str(ph)}")
+                results[fn] = compute_phash_from_pil(img)
+                log.info(f"Loaded spam image '{fn}', phash={str(results[fn])}")
         except UnidentifiedImageError:
-            log.warning(f"Skipped non-image file in spam folder: {fn}")
+            log.warning(f"Skipped non-image file: {fn}")
         except Exception as e:
             log.exception(f"Error loading '{fn}': {e}")
     return results
@@ -96,72 +86,71 @@ def load_hashes_from_json(infile: str = HASHES_FILE) -> Dict[str, imagehash.Imag
         return {}
 
 async def download_image_bytes(url: str) -> bytes:
-    clean_url = url.split('?')[0]  # remove query parameters
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(clean_url) as resp:
+        async with session.get(url) as resp:
             if resp.status != 200:
-                raise RuntimeError(f"Failed to GET {clean_url} -> {resp.status}")
+                raise RuntimeError(f"Failed to GET {url} -> {resp.status}")
             return await resp.read()
+
+async def compute_phash_from_bytes(data: bytes) -> imagehash.ImageHash:
+    with io.BytesIO(data) as b:
+        with Image.open(b) as img:
+            return compute_phash_from_pil(img)
 
 def is_similar_hash(h1: imagehash.ImageHash, h2: imagehash.ImageHash, tol: int = HASH_TOLERANCE) -> bool:
     return (h1 - h2) <= tol
 
-# ---------- Bot events ----------
+# ---------- Bot Events ----------
+
+@bot.event
+async def on_ready():
+    global known_hashes
+    log.info(f"Logged in as {bot.user} (id: {bot.user.id})")
+    loaded = load_hashes_from_json()
+    if loaded:
+        known_hashes = loaded
+    else:
+        known_hashes = load_hashes_from_folder()
+        save_hashes_to_json(known_hashes)
+    log.info(f"Known spam fingerprints: {len(known_hashes)}")
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author == bot.user:
         return
 
-    images_to_check = []
+    if message.attachments:
+        for att in message.attachments:
+            ctype = getattr(att, "content_type", None)
+            if ctype and not ctype.startswith("image"):
+                continue
+            try:
+                data = await download_image_bytes(att.url)
+                att_hash = await compute_phash_from_bytes(data)
+            except Exception as e:
+                log.warning(f"Failed to process {att.filename}: {e}")
+                continue
 
-    # 1️⃣ Attachments
-    for att in message.attachments:
-        ctype = getattr(att, "content_type", None)
-        if ctype and not ctype.startswith("image"):
-            continue
-        try:
-            data = await download_image_bytes(att.url)
-            with Image.open(io.BytesIO(data)) as img:
-                images_to_check.append(img.copy())
-        except Exception as e:
-            log.warning(f"Failed to process attachment {att.filename}: {e}")
-
-    # 2️⃣ Discord media links with query params intact
-    for match in DISCORD_MEDIA_RE.findall(message.content):
-        try:
-            data = await download_image_bytes(match)  # full URL with query string
-            with Image.open(io.BytesIO(data)) as img:
-                images_to_check.append(img.copy())
-        except Exception as e:
-            log.warning(f"Failed to fetch image from link {match}: {e}")
-
-    # 3️⃣ Check images
-    for img in images_to_check:
-        phash = compute_phash_from_pil(img)
-        for spam_name, spam_hash in known_hashes.items():
-            if is_similar_hash(phash, spam_hash):
-                try:
-                    await message.delete()
+            for spam_name, spam_hash in known_hashes.items():
+                if is_similar_hash(att_hash, spam_hash):
                     try:
-                        await message.channel.send(
-                            f"{ALERT_MESSAGE} Removed an image posted by {message.author.mention}.",
-                            delete_after=6
-                        )
+                        await message.delete()
+                        try:
+                            await message.channel.send(f"{ALERT_MESSAGE} Removed an image posted by {message.author.mention}.", delete_after=6)
+                        except discord.Forbidden:
+                            log.warning("No permission to send alert in channel.")
+                        log.info(f"Deleted spam image from {message.author} (match: {spam_name})")
                     except discord.Forbidden:
-                        log.warning("No permission to send message in channel to notify.")
-                    log.info(f"Deleted spam image from {message.author} (match: {spam_name}) in {message.guild}/{message.channel}")
-                except discord.Forbidden:
-                    log.error("Missing permissions to delete messages.")
-                except Exception as e:
-                    log.exception("Failed deleting message: %s", e)
-                await bot.process_commands(message)
-                return
+                        log.error("Missing permissions to delete messages.")
+                    except Exception as e:
+                        log.exception(f"Failed deleting message: {e}")
+                    await bot.process_commands(message)
+                    return
 
     await bot.process_commands(message)
 
-# ---------- Admin commands ----------
+# ---------- Admin Commands ----------
 
 def is_guild_mod():
     async def predicate(ctx):
@@ -185,7 +174,7 @@ async def list_hashes(ctx):
     if not known_hashes:
         await ctx.send("No spam fingerprints loaded.", delete_after=6)
         return
-    lines = [f"{i+1}. {name}  —  {str(h)}" for i, (name, h) in enumerate(known_hashes.items())]
+    lines = [f"{i+1}. {name} — {str(h)}" for i, (name, h) in enumerate(known_hashes.items())]
     text = "\n".join(lines)
     if len(text) < 1900:
         await ctx.send(f"Known spam fingerprints ({len(known_hashes)}):\n```\n{text}\n```", delete_after=20)
@@ -199,7 +188,7 @@ async def list_hashes(ctx):
 async def add_spam(ctx):
     attachments = ctx.message.attachments
     if not attachments:
-        await ctx.send("Attach one or more images to add as spam fingerprints.", delete_after=8)
+        await ctx.send("Attach image(s) to add as spam fingerprints.", delete_after=8)
         return
 
     added = 0
@@ -211,17 +200,15 @@ async def add_spam(ctx):
             data = await download_image_bytes(att.url)
             with Image.open(io.BytesIO(data)) as img:
                 img = ImageOps.exif_transpose(img).convert("RGB")
-                safe_name = f"{int(asyncio.get_event_loop().time()*1000)}_{os.path.basename(att.filename)}"
-                safe_name = safe_name.replace(" ", "_")
+                safe_name = f"{int(asyncio.get_event_loop().time()*1000)}_{os.path.basename(att.filename)}".replace(" ", "_")
                 os.makedirs(SPAM_FOLDER, exist_ok=True)
                 out_path = os.path.join(SPAM_FOLDER, safe_name)
                 img.save(out_path, format="PNG", optimize=True)
                 ph = compute_phash_from_pil(img)
-                known_hashes[os.path.basename(out_path)] = ph
+                known_hashes[safe_name] = ph
                 added += 1
         except Exception as e:
-            log.exception("Failed adding spam image: %s", e)
-            continue
+            log.exception(f"Failed adding spam image: {e}")
 
     save_hashes_to_json(known_hashes)
     await ctx.send(f"Added {added} image(s) to spam fingerprints.", delete_after=8)
@@ -246,9 +233,8 @@ async def remove_spam(ctx, *, name: str):
 async def ping(ctx):
     await ctx.send("pong", delete_after=5)
 
-# ---------- Flask keep-alive for Render ----------
-
-app = Flask('')
+# ---------- Keep-alive Flask server ----------
+app = Flask("SentraAlive")
 
 @app.route('/')
 def home():
@@ -257,10 +243,9 @@ def home():
 def run_web():
     app.run(host='0.0.0.0', port=10000)
 
-threading.Thread(target=run_web, daemon=True).start()
+Thread(target=run_web, daemon=True).start()
 
-# ---------- Start bot ----------
-
+# ---------- Start Bot ----------
 def main():
     token = os.environ.get(ENV_TOKEN_NAME)
     if not token:
