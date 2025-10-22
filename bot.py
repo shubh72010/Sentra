@@ -137,14 +137,16 @@ async def on_message(message: discord.Message):
         except Exception as e:
             log.warning(f"Failed to process attachment {att.filename}: {e}")
 
-    # 2️⃣ Add Discord media links using regex
-    for match in DISCORD_MEDIA_RE.findall(message.content):
-        try:
-            data = await download_image_bytes(match)
-            with Image.open(io.BytesIO(data)) as img:
-                images_to_check.append(img.copy())
-        except Exception as e:
-            log.warning(f"Failed to fetch image from link {match}: {e}")
+# 2️⃣ Add Discord media links using regex
+for match in DISCORD_MEDIA_RE.findall(message.content):
+    try:
+        # Strip query parameters
+        url = match.split("?")[0]
+        data = await download_image_bytes(url)
+        with Image.open(io.BytesIO(data)) as img:
+            images_to_check.append(img.copy())
+    except Exception as e:
+        log.warning(f"Failed to fetch image from link {match}: {e}")
 
     # 3️⃣ Check all images
     for img in images_to_check:
